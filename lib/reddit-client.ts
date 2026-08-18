@@ -3,6 +3,9 @@ import type { RedditPost } from "./types";
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SubredditVibeCheck/1.0";
 
+const FETCH_TIMEOUT_MS = 8000;
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
 function parseRssXml(xml: string): RedditPost[] {
   if (xml.includes("<title>Blocked</title>")) {
     throw new Error("Reddit blocked the request.");
@@ -43,8 +46,19 @@ function getRssUrl(subreddit: string) {
   return `https://www.reddit.com/r/${subreddit}/hot/.rss?limit=100`;
 }
 
+async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchRssFromUrl(url: string): Promise<RedditPost[]> {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       "User-Agent": USER_AGENT,
       Accept: "application/atom+xml,text/xml,*/*",
@@ -59,9 +73,7 @@ async function fetchRssFromUrl(url: string): Promise<RedditPost[]> {
     throw new Error(`Reddit returned ${response.status}.`);
   }
 
-  const xml = await response.text();
-  const posts = parseRssXml(xml);
-
+  const posts = parseRssXml(await response.text());
   if (!posts.length) {
     throw new Error("No posts found for this subreddit.");
   }
@@ -69,49 +81,88 @@ async function fetchRssFromUrl(url: string): Promise<RedditPost[]> {
   return posts.slice(0, 50);
 }
 
-async function fetchViaProxy(url: string): Promise<RedditPost[]> {
-  const proxyUrls = [
-    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  ];
+async function fetchRssViaProxy(url: string): Promise<RedditPost[]> {
+  const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+  const response = await fetchWithTimeout(proxyUrl);
 
-  for (const proxyUrl of proxyUrls) {
-    try {
-      const response = await fetch(proxyUrl);
-      if (!response.ok) continue;
-      const posts = parseRssXml(await response.text());
-      if (posts.length) return posts.slice(0, 50);
-    } catch {
-      continue;
-    }
+  if (!response.ok) {
+    throw new Error(`Proxy returned ${response.status}.`);
   }
 
-  throw new Error("Could not reach Reddit.");
+  const posts = parseRssXml(await response.text());
+  if (!posts.length) {
+    throw new Error("Proxy returned no posts.");
+  }
+
+  return posts.slice(0, 50);
+}
+
+async function fetchFromApiRoute(subreddit: string): Promise<RedditPost[]> {
+  const response = await fetchWithTimeout(
+    `/api/reddit?subreddit=${encodeURIComponent(subreddit)}`
+  );
+
+  if (!response.ok) {
+    throw new Error("API route failed.");
+  }
+
+  const data = (await response.json()) as { posts?: RedditPost[] };
+  if (!data.posts?.length) {
+    throw new Error("API route returned no posts.");
+  }
+
+  return data.posts.slice(0, 50);
+}
+
+function getCachedPosts(subreddit: string): RedditPost[] | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const raw = sessionStorage.getItem(`vibe-cache:${subreddit}`);
+    if (!raw) return null;
+
+    const cached = JSON.parse(raw) as { posts: RedditPost[]; expires: number };
+    if (Date.now() > cached.expires) {
+      sessionStorage.removeItem(`vibe-cache:${subreddit}`);
+      return null;
+    }
+
+    return cached.posts;
+  } catch {
+    return null;
+  }
+}
+
+function setCachedPosts(subreddit: string, posts: RedditPost[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    sessionStorage.setItem(
+      `vibe-cache:${subreddit}`,
+      JSON.stringify({ posts, expires: Date.now() + CACHE_TTL_MS })
+    );
+  } catch {
+    // Ignore storage quota errors.
+  }
 }
 
 export async function fetchSubredditPostsClient(subreddit: string): Promise<RedditPost[]> {
+  const cached = getCachedPosts(subreddit);
+  if (cached) return cached;
+
   const rssUrl = getRssUrl(subreddit);
+
   const strategies = [
+    () => fetchFromApiRoute(subreddit),
     () => fetchRssFromUrl(rssUrl),
-    () => fetchViaProxy(rssUrl),
-    async () => {
-      const response = await fetch(`/api/reddit?subreddit=${encodeURIComponent(subreddit)}`);
-      if (!response.ok) throw new Error("API route failed");
-      const data = (await response.json()) as { posts?: RedditPost[] };
-      if (!data.posts?.length) throw new Error("No posts from API");
-      return data.posts.slice(0, 50);
-    },
+    () => fetchRssViaProxy(rssUrl),
   ];
 
-  let lastError = "Could not reach Reddit. Please try again in a moment.";
-
-  for (const strategy of strategies) {
-    try {
-      return await strategy();
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : lastError;
-    }
+  try {
+    const posts = await Promise.any(strategies.map((strategy) => strategy()));
+    setCachedPosts(subreddit, posts);
+    return posts;
+  } catch {
+    throw new Error("Could not reach Reddit. Please try again in a moment.");
   }
-
-  throw new Error(lastError);
 }
