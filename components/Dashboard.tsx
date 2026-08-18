@@ -8,7 +8,7 @@ import { analyzePosts, summarizeSentiment } from "@/lib/sentiment";
 import { isValidSubreddit, normalizeSubreddit } from "@/lib/subreddit";
 import type { AnalyzedPost, SentimentLabel } from "@/lib/types";
 
-const PRESETS = ["javascript", "webdev", "news", "technology", "programming"];
+const PRESETS = ["javascript", "webdev", "india", "technology", "ai"];
 
 const vibeConfig: Record<
   SentimentLabel,
