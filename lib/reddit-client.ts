@@ -1,9 +1,10 @@
+import { normalizeSubreddit } from "@/lib/subreddit";
 import type { RedditPost } from "./types";
 
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SubredditVibeCheck/1.0";
 
-const FETCH_TIMEOUT_MS = 8000;
+const FETCH_TIMEOUT_MS = 15000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 function parseRssXml(xml: string): RedditPost[] {
@@ -147,20 +148,21 @@ function setCachedPosts(subreddit: string, posts: RedditPost[]) {
 }
 
 export async function fetchSubredditPostsClient(subreddit: string): Promise<RedditPost[]> {
-  const cached = getCachedPosts(subreddit);
+  const cleaned = normalizeSubreddit(subreddit);
+  const cached = getCachedPosts(cleaned);
   if (cached) return cached;
 
-  const rssUrl = getRssUrl(subreddit);
+  const rssUrl = getRssUrl(cleaned);
 
   const strategies = [
-    () => fetchFromApiRoute(subreddit),
     () => fetchRssFromUrl(rssUrl),
     () => fetchRssViaProxy(rssUrl),
+    () => fetchFromApiRoute(cleaned),
   ];
 
   try {
     const posts = await Promise.any(strategies.map((strategy) => strategy()));
-    setCachedPosts(subreddit, posts);
+    setCachedPosts(cleaned, posts);
     return posts;
   } catch {
     throw new Error("Could not reach Reddit. Please try again in a moment.");

@@ -1,16 +1,17 @@
 import { NextResponse } from "next/server";
 
 import { fetchSubredditPosts } from "@/lib/reddit";
+import { isValidSubreddit, normalizeSubreddit } from "@/lib/subreddit";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const subreddit = searchParams.get("subreddit")?.trim().replace(/^r\//, "");
+  const subreddit = normalizeSubreddit(searchParams.get("subreddit") ?? "");
 
   if (!subreddit) {
     return NextResponse.json({ error: "Subreddit is required." }, { status: 400 });
   }
 
-  if (!/^[A-Za-z0-9_]+$/.test(subreddit)) {
+  if (!isValidSubreddit(subreddit)) {
     return NextResponse.json({ error: "Invalid subreddit name." }, { status: 400 });
   }
 

@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 
 import { analyzePosts, summarizeSentiment } from "@/lib/sentiment";
 import { fetchSubredditPostsClient } from "@/lib/reddit-client";
+import { isValidSubreddit, normalizeSubreddit } from "@/lib/subreddit";
 import type { AnalyzedPost } from "@/lib/types";
 
 const PRESETS = ["javascript", "webdev", "news", "technology", "programming"];
@@ -27,9 +28,14 @@ export default function Dashboard() {
   );
 
   async function handleAnalyze(targetSubreddit = subreddit) {
-    const cleaned = targetSubreddit.trim().replace(/^r\//, "");
+    const cleaned = normalizeSubreddit(targetSubreddit);
     if (!cleaned) {
       setError("Enter a subreddit name.");
+      return;
+    }
+
+    if (!isValidSubreddit(cleaned)) {
+      setError("Invalid subreddit name. Use letters, numbers, and underscores only.");
       return;
     }
 
