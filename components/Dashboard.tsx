@@ -182,7 +182,9 @@ export default function Dashboard() {
                       </span>
                     </td>
                     <td className="px-6 py-4 font-mono text-zinc-700">{post.sentimentScore}</td>
-                    <td className="px-6 py-4 text-zinc-600">{post.score.toLocaleString()}</td>
+                    <td className="px-6 py-4 text-zinc-600">
+                      {post.score > 0 ? post.score.toLocaleString() : "—"}
+                    </td>
                   </tr>
                 ))}
               </tbody>

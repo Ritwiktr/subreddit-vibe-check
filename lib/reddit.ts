@@ -10,88 +10,54 @@ export interface RedditPost {
   author: string;
 }
 
-interface RedditListing {
-  data: {
-    after: string | null;
-    children: Array<{
-      data: {
-        title: string;
-        score: number;
-        permalink: string;
-        author: string;
-      };
-    }>;
-  };
-}
+function parseRssXml(xml: string): RedditPost[] {
+  const $ = cheerio.load(xml, { xmlMode: true });
+  const posts: RedditPost[] = [];
 
-function getOAuthConfig() {
-  const clientId = process.env.REDDIT_CLIENT_ID;
-  const clientSecret = process.env.REDDIT_CLIENT_SECRET;
-  const username = process.env.REDDIT_USERNAME;
-  const password = process.env.REDDIT_PASSWORD;
+  $("entry").each((_, element) => {
+    const title = $(element).find("title").first().text().trim();
+    const url = $(element).find("link").first().attr("href") ?? "";
+    const authorRaw = $(element).find("author name").first().text().trim();
 
-  if (!clientId || !clientSecret || !username || !password) {
-    return null;
-  }
+    if (!title || !url || title === "Blocked") return;
 
-  return { clientId, clientSecret, username, password };
-}
-
-async function getAccessToken(config: NonNullable<ReturnType<typeof getOAuthConfig>>) {
-  const credentials = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString(
-    "base64"
-  );
-
-  const response = await fetch("https://www.reddit.com/api/v1/access_token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": USER_AGENT,
-    },
-    body: new URLSearchParams({
-      grant_type: "password",
-      username: config.username,
-      password: config.password,
-    }),
+    posts.push({
+      title,
+      score: 0,
+      url,
+      author: authorRaw.replace(/^\/u\//, "") || "unknown",
+    });
   });
 
-  if (!response.ok) {
-    throw new Error("Reddit authentication failed. Check your API credentials.");
-  }
-
-  const data = (await response.json()) as { access_token: string };
-  return data.access_token;
+  return posts;
 }
 
-async function fetchWithOAuth(
-  subreddit: string,
-  token: string,
-  after?: string
-): Promise<RedditListing> {
-  const params = new URLSearchParams({ limit: "25" });
-  if (after) params.set("after", after);
-
+async function fetchViaRss(subreddit: string): Promise<RedditPost[]> {
   const response = await fetch(
-    `https://oauth.reddit.com/r/${subreddit}/hot?${params.toString()}`,
+    `https://www.reddit.com/r/${subreddit}/hot/.rss?limit=100`,
     {
       headers: {
-        Authorization: `Bearer ${token}`,
         "User-Agent": USER_AGENT,
+        Accept: "application/atom+xml,text/xml,*/*",
       },
-      next: { revalidate: 60 },
+      cache: "no-store",
     }
   );
 
-  if (!response.ok) {
-    throw new Error(
-      response.status === 404
-        ? "Subreddit not found. Check the name and try again."
-        : `Reddit returned ${response.status}. Try again later.`
-    );
+  if (response.status === 404) {
+    throw new Error("Subreddit not found. Check the name and try again.");
   }
 
-  return (await response.json()) as RedditListing;
+  if (!response.ok) {
+    throw new Error(`Reddit RSS returned ${response.status}.`);
+  }
+
+  const posts = parseRssXml(await response.text());
+  if (!posts.length) {
+    throw new Error("Subreddit not found or has no hot posts.");
+  }
+
+  return posts.slice(0, 50);
 }
 
 async function fetchOldRedditPage(url: string): Promise<{
@@ -100,7 +66,7 @@ async function fetchOldRedditPage(url: string): Promise<{
 }> {
   const response = await fetch(url, {
     headers: { "User-Agent": USER_AGENT },
-    next: { revalidate: 60 },
+    cache: "no-store",
   });
 
   if (response.status === 404) {
@@ -108,7 +74,7 @@ async function fetchOldRedditPage(url: string): Promise<{
   }
 
   if (!response.ok) {
-    throw new Error(`Reddit returned ${response.status}. Try again later.`);
+    throw new Error(`Reddit returned ${response.status}.`);
   }
 
   const html = await response.text();
@@ -151,35 +117,21 @@ async function fetchViaOldReddit(subreddit: string): Promise<RedditPost[]> {
   return [...firstPage.posts, ...secondPage.posts].slice(0, 50);
 }
 
-function listingToPosts(listing: RedditListing): RedditPost[] {
-  return listing.data.children.map(({ data }) => ({
-    title: data.title,
-    score: data.score,
-    url: `https://www.reddit.com${data.permalink}`,
-    author: data.author,
-  }));
-}
-
-async function fetchViaOAuth(subreddit: string): Promise<RedditPost[]> {
-  const oauthConfig = getOAuthConfig();
-  if (!oauthConfig) return fetchViaOldReddit(subreddit);
-
-  const token = await getAccessToken(oauthConfig);
-  const firstPage = await fetchWithOAuth(subreddit, token);
-  const secondPage = firstPage.data.after
-    ? await fetchWithOAuth(subreddit, token, firstPage.data.after)
-    : null;
-
-  return [
-    ...listingToPosts(firstPage),
-    ...(secondPage ? listingToPosts(secondPage) : []),
-  ].slice(0, 50);
-}
-
 export async function fetchSubredditPosts(subreddit: string): Promise<RedditPost[]> {
-  try {
-    return await fetchViaOAuth(subreddit);
-  } catch {
-    return fetchViaOldReddit(subreddit);
+  const strategies = [
+    () => fetchViaRss(subreddit),
+    () => fetchViaOldReddit(subreddit),
+  ];
+
+  let lastError = "Failed to fetch subreddit data.";
+
+  for (const strategy of strategies) {
+    try {
+      return await strategy();
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : lastError;
+    }
   }
+
+  throw new Error(lastError);
 }
