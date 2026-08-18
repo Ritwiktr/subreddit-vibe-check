@@ -1,9 +1,11 @@
 import * as cheerio from "cheerio";
 
+import { SubredditNotFoundError } from "@/lib/errors";
+
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SubredditVibeCheck/1.0 by SeasonNo9747";
 
-const FETCH_TIMEOUT_MS = 15000;
+const FETCH_TIMEOUT_MS = 20000;
 
 export interface RedditPost {
   title: string;
@@ -23,7 +25,7 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise
   }
 }
 
-function parseRssXml(xml: string): RedditPost[] {
+function parseRssXml(xml: string, subreddit: string): RedditPost[] {
   const $ = cheerio.load(xml, { xmlMode: true });
   const posts: RedditPost[] = [];
 
@@ -32,7 +34,7 @@ function parseRssXml(xml: string): RedditPost[] {
     const url = $(element).find("link").first().attr("href") ?? "";
     const authorRaw = $(element).find("author name").first().text().trim();
 
-    if (!title || !url || title === "Blocked") return;
+    if (!title || !url || !authorRaw.startsWith("/u/")) return;
 
     posts.push({
       title,
@@ -41,6 +43,10 @@ function parseRssXml(xml: string): RedditPost[] {
       author: authorRaw.replace(/^\/u\//, "") || "unknown",
     });
   });
+
+  if (!posts.length && xml.toLowerCase().includes("page not found")) {
+    throw new SubredditNotFoundError(subreddit);
+  }
 
   return posts;
 }
@@ -58,19 +64,19 @@ async function fetchViaRss(subreddit: string): Promise<RedditPost[]> {
   );
 
   if (response.status === 404) {
-    throw new Error("Subreddit not found.");
+    throw new SubredditNotFoundError(subreddit);
   }
 
   if (!response.ok) {
     throw new Error(`RSS ${response.status}`);
   }
 
-  const posts = parseRssXml(await response.text());
-  if (!posts.length) throw new Error("No RSS posts");
+  const posts = parseRssXml(await response.text(), subreddit);
+  if (!posts.length) throw new SubredditNotFoundError(subreddit);
   return posts.slice(0, 50);
 }
 
-async function fetchOldRedditPage(url: string): Promise<{
+async function fetchOldRedditPage(url: string, subreddit: string): Promise<{
   posts: RedditPost[];
   nextUrl?: string;
 }> {
@@ -80,7 +86,7 @@ async function fetchOldRedditPage(url: string): Promise<{
   });
 
   if (response.status === 404) {
-    throw new Error("Subreddit not found.");
+    throw new SubredditNotFoundError(subreddit);
   }
 
   if (!response.ok) {
@@ -113,24 +119,42 @@ async function fetchOldRedditPage(url: string): Promise<{
 }
 
 async function fetchViaOldReddit(subreddit: string): Promise<RedditPost[]> {
-  const firstPage = await fetchOldRedditPage(`https://old.reddit.com/r/${subreddit}/hot/`);
+  const firstPage = await fetchOldRedditPage(
+    `https://old.reddit.com/r/${subreddit}/hot/`,
+    subreddit
+  );
 
   if (!firstPage.posts.length) {
-    throw new Error("No HTML posts");
+    throw new SubredditNotFoundError(subreddit);
   }
 
   if (!firstPage.nextUrl || firstPage.posts.length >= 50) {
     return firstPage.posts.slice(0, 50);
   }
 
-  const secondPage = await fetchOldRedditPage(firstPage.nextUrl);
+  const secondPage = await fetchOldRedditPage(firstPage.nextUrl, subreddit);
   return [...firstPage.posts, ...secondPage.posts].slice(0, 50);
 }
 
 export async function fetchSubredditPosts(subreddit: string): Promise<RedditPost[]> {
-  try {
-    return await Promise.any([fetchViaRss(subreddit), fetchViaOldReddit(subreddit)]);
-  } catch {
-    throw new Error("Failed to fetch subreddit data.");
+  const strategies = [() => fetchViaRss(subreddit), () => fetchViaOldReddit(subreddit)];
+
+  let notFound = false;
+
+  for (const strategy of strategies) {
+    try {
+      return await strategy();
+    } catch (error) {
+      if (error instanceof SubredditNotFoundError) {
+        notFound = true;
+        continue;
+      }
+    }
   }
+
+  if (notFound) {
+    throw new SubredditNotFoundError(subreddit);
+  }
+
+  throw new Error("Failed to fetch subreddit data.");
 }

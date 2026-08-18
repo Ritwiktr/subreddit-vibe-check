@@ -1,15 +1,15 @@
+import { RedditNetworkError, SubredditNotFoundError } from "@/lib/errors";
 import { normalizeSubreddit } from "@/lib/subreddit";
 import type { RedditPost } from "./types";
 
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SubredditVibeCheck/1.0";
 
-const FETCH_TIMEOUT_MS = 15000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
-function parseRssXml(xml: string): RedditPost[] {
-  if (xml.includes("<title>Blocked</title>")) {
-    throw new Error("Reddit blocked the request.");
+function parseRssXml(xml: string, subreddit: string): RedditPost[] {
+  if (xml.includes("<title>Blocked</title>") || xml.includes("whoa there, pardner")) {
+    throw new RedditNetworkError();
   }
 
   const posts: RedditPost[] = [];
@@ -21,14 +21,18 @@ function parseRssXml(xml: string): RedditPost[] {
     const url = entry.match(/<link href="([^"]+)"/)?.[1];
     const authorRaw = entry.match(/<name>([\s\S]*?)<\/name>/)?.[1]?.trim();
 
-    if (!title || !url || title === "Blocked") continue;
+    if (!title || !url || !authorRaw?.startsWith("/u/")) continue;
 
     posts.push({
       title: decodeXmlEntities(title),
       score: 0,
       url,
-      author: authorRaw?.replace(/^\/u\//, "") ?? "unknown",
+      author: authorRaw.replace(/^\/u\//, ""),
     });
+  }
+
+  if (!posts.length && xml.includes("page not found")) {
+    throw new SubredditNotFoundError(subreddit);
   }
 
   return posts;
@@ -47,9 +51,13 @@ function getRssUrl(subreddit: string) {
   return `https://www.reddit.com/r/${subreddit}/hot/.rss?limit=100`;
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 20000
+): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     return await fetch(url, { ...options, signal: controller.signal });
@@ -58,58 +66,86 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}): Promise
   }
 }
 
-async function fetchRssFromUrl(url: string): Promise<RedditPost[]> {
-  const response = await fetchWithTimeout(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "application/atom+xml,text/xml,*/*",
-    },
-  });
+async function fetchText(
+  url: string,
+  subreddit: string,
+  options: RequestInit = {},
+  timeoutMs = 20000
+) {
+  const response = await fetchWithTimeout(url, options, timeoutMs);
 
   if (response.status === 404) {
-    throw new Error("Subreddit not found. Check the name and try again.");
+    throw new SubredditNotFoundError(subreddit);
   }
 
-  if (!response.ok) {
-    throw new Error(`Reddit returned ${response.status}.`);
+  const text = await response.text();
+
+  if (text.startsWith("{")) {
+    try {
+      const json = JSON.parse(text) as { error?: string; contents?: string };
+      if (json.error) throw new RedditNetworkError();
+      if (json.contents) return json.contents;
+    } catch (error) {
+      if (error instanceof RedditNetworkError) throw error;
+    }
   }
 
-  const posts = parseRssXml(await response.text());
-  if (!posts.length) {
-    throw new Error("No posts found for this subreddit.");
-  }
+  return text;
+}
 
+async function fetchRssDirect(subreddit: string): Promise<RedditPost[]> {
+  const url = getRssUrl(subreddit);
+  const text = await fetchText(
+    url,
+    subreddit,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/atom+xml,text/xml,*/*",
+      },
+    }
+  );
+
+  const posts = parseRssXml(text, subreddit);
+  if (!posts.length) throw new SubredditNotFoundError(subreddit);
   return posts.slice(0, 50);
 }
 
-async function fetchRssViaProxy(url: string): Promise<RedditPost[]> {
-  const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
-  const response = await fetchWithTimeout(proxyUrl);
+async function fetchRssViaProxy(subreddit: string, proxyBase: string): Promise<RedditPost[]> {
+  const target = getRssUrl(subreddit);
+  const proxyUrl =
+    proxyBase === "corsproxy"
+      ? `https://corsproxy.io/?url=${encodeURIComponent(target)}`
+      : `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
 
-  if (!response.ok) {
-    throw new Error(`Proxy returned ${response.status}.`);
-  }
-
-  const posts = parseRssXml(await response.text());
-  if (!posts.length) {
-    throw new Error("Proxy returned no posts.");
-  }
-
+  const text = await fetchText(proxyUrl, subreddit, {}, 25000);
+  const posts = parseRssXml(text, subreddit);
+  if (!posts.length) throw new SubredditNotFoundError(subreddit);
   return posts.slice(0, 50);
 }
 
 async function fetchFromApiRoute(subreddit: string): Promise<RedditPost[]> {
   const response = await fetchWithTimeout(
-    `/api/reddit?subreddit=${encodeURIComponent(subreddit)}`
+    `/api/reddit?subreddit=${encodeURIComponent(subreddit)}`,
+    {},
+    20000
   );
 
-  if (!response.ok) {
-    throw new Error("API route failed.");
+  const data = (await response.json()) as { posts?: RedditPost[]; error?: string };
+
+  if (response.status === 404) {
+    throw new SubredditNotFoundError(subreddit);
   }
 
-  const data = (await response.json()) as { posts?: RedditPost[] };
+  if (!response.ok) {
+    if (data.error?.toLowerCase().includes("not found")) {
+      throw new SubredditNotFoundError(subreddit);
+    }
+    throw new RedditNetworkError();
+  }
+
   if (!data.posts?.length) {
-    throw new Error("API route returned no posts.");
+    throw new SubredditNotFoundError(subreddit);
   }
 
   return data.posts.slice(0, 50);
@@ -152,19 +188,31 @@ export async function fetchSubredditPostsClient(subreddit: string): Promise<Redd
   const cached = getCachedPosts(cleaned);
   if (cached) return cached;
 
-  const rssUrl = getRssUrl(cleaned);
-
-  const strategies = [
-    () => fetchRssFromUrl(rssUrl),
-    () => fetchRssViaProxy(rssUrl),
+  const strategies: Array<() => Promise<RedditPost[]>> = [
+    () => fetchRssViaProxy(cleaned, "corsproxy"),
     () => fetchFromApiRoute(cleaned),
+    () => fetchRssDirect(cleaned),
+    () => fetchRssViaProxy(cleaned, "allorigins"),
   ];
 
-  try {
-    const posts = await Promise.any(strategies.map((strategy) => strategy()));
-    setCachedPosts(cleaned, posts);
-    return posts;
-  } catch {
-    throw new Error("Could not reach Reddit. Please try again in a moment.");
+  let notFound = false;
+
+  for (const strategy of strategies) {
+    try {
+      const posts = await strategy();
+      setCachedPosts(cleaned, posts);
+      return posts;
+    } catch (error) {
+      if (error instanceof SubredditNotFoundError) {
+        notFound = true;
+        continue;
+      }
+    }
   }
+
+  if (notFound) {
+    throw new SubredditNotFoundError(cleaned);
+  }
+
+  throw new RedditNetworkError();
 }

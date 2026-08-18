@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { SubredditNotFoundError } from "@/lib/errors";
 import { fetchSubredditPosts } from "@/lib/reddit";
 import { isValidSubreddit, normalizeSubreddit } from "@/lib/subreddit";
 
@@ -19,6 +20,10 @@ export async function GET(request: Request) {
     const posts = await fetchSubredditPosts(subreddit);
     return NextResponse.json({ subreddit, posts });
   } catch (error) {
+    if (error instanceof SubredditNotFoundError) {
+      return NextResponse.json({ error: error.message }, { status: 404 });
+    }
+
     const message =
       error instanceof Error ? error.message : "Failed to fetch subreddit data.";
     return NextResponse.json({ error: message }, { status: 502 });
