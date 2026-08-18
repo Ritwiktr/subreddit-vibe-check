@@ -3,7 +3,8 @@
 import { useMemo, useState } from "react";
 
 import { analyzePosts, summarizeSentiment } from "@/lib/sentiment";
-import type { AnalyzedPost, RedditPost } from "@/lib/types";
+import { fetchSubredditPostsClient } from "@/lib/reddit-client";
+import type { AnalyzedPost } from "@/lib/types";
 
 const PRESETS = ["javascript", "webdev", "news", "technology", "programming"];
 
@@ -37,16 +38,8 @@ export default function Dashboard() {
     setSubreddit(cleaned);
 
     try {
-      const response = await fetch(
-        `/api/reddit?subreddit=${encodeURIComponent(cleaned)}`
-      );
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error ?? "Something went wrong.");
-      }
-
-      const analyzed = analyzePosts(data.posts as RedditPost[]);
+      const fetchedPosts = await fetchSubredditPostsClient(cleaned);
+      const analyzed = analyzePosts(fetchedPosts);
       setPosts(analyzed);
       setHasSearched(true);
     } catch (err) {
